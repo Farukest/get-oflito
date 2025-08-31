@@ -227,7 +227,7 @@ impl<P> OffchainMarketMonitor<P> where
         prover_addr: Address,
         provider: Arc<P>,
         config: ConfigLock,
-        contract_address: Address,
+        market_addr: Address,
     ) -> Result<(), OffchainMarketMonitorErr> {
         // Config'i başta oku
         let monitor_config = {
@@ -271,8 +271,6 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🎧 Offchain market monitor started on port {}", monitor_config.listen_port);
 
-        let is_processing = Arc::new(AtomicBool::new(false));
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -281,7 +279,6 @@ impl<P> OffchainMarketMonitor<P> where
                             let signer = signer.clone();
                             let provider = provider.clone();
                             let config = monitor_config.clone();
-                            let is_processing = is_processing.clone();
 
                             tokio::spawn(async move {
                                 let mut buffer = [0; 4096];
@@ -293,9 +290,8 @@ impl<P> OffchainMarketMonitor<P> where
                                             &signer,
                                             &provider,
                                             &config,
-                                            contract_address,
+                                            market_addr,
                                             prover_addr,
-                                            &is_processing,
                                         ).await;
 
                                         if let Err(e) = socket.write_all(response.as_bytes()).await {
@@ -332,7 +328,6 @@ impl<P> OffchainMarketMonitor<P> where
         config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
-        is_processing: &Arc<AtomicBool>,
     ) -> String {
         // Basit HTTP parsing
         let lines: Vec<&str> = request.lines().collect();
@@ -346,7 +341,7 @@ impl<P> OffchainMarketMonitor<P> where
                     let body_lines = &lines[empty_line_index + 1..];
                     let body = body_lines.join("\n");
 
-                    return Self::process_order(body, signer, provider, config, contract_address, prover_addr, is_processing).await;
+                    return Self::process_order(body, signer, provider, config, contract_address, prover_addr).await;
                 }
             }
         }
@@ -367,16 +362,10 @@ impl<P> OffchainMarketMonitor<P> where
         config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
-        is_processing: &Arc<AtomicBool>,
     ) -> String {
         // Eğer committed orders bekleme modundaysak order processing yapma
         if IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed) {
             return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"waiting_for_committed_orders\"}\r\n".to_string();
-        }
-
-        if is_processing.load(Ordering::Relaxed) {
-            tracing::warn!("Zaten bir transaction işleniyor, yeni order beklemede...");
-            return "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Already processing\"}\r\n".to_string();
         }
 
         // JSON parse et
@@ -387,16 +376,14 @@ impl<P> OffchainMarketMonitor<P> where
             }
         };
 
-        // Order data'yı parse et
-        let order_data = match Self::parse_order_from_json(&order_json) {
+        // Direk OrderData'ya deserialize et
+        let order_data: boundless_market::order_stream_client::OrderData = match serde_json::from_str(&body) {
             Ok(data) => data,
             Err(e) => {
                 tracing::error!("Failed to parse order data: {:?}", e);
-                return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid order format\"}\r\n".to_string();
+                return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid JSON\"}\r\n".to_string();
             }
         };
-
-        is_processing.store(true, Ordering::Relaxed);
 
         let request_id = order_data.order.request.id;
         let client_addr = order_data.order.request.client_address();
@@ -405,7 +392,6 @@ impl<P> OffchainMarketMonitor<P> where
         if let Some(ref allow_addresses) = config.allowed_requestors {
             if !allow_addresses.contains(&client_addr) {
                 tracing::debug!("Client not in allowed requestors, skipping request: 0x{:x}", request_id);
-                is_processing.store(false, Ordering::Relaxed);
                 return "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Client not allowed\"}\r\n".to_string();
             }
         }
@@ -422,7 +408,6 @@ impl<P> OffchainMarketMonitor<P> where
                 order_data.order.request.offer.lockTimeout,
                 config.min_allowed_lock_timeout_secs
             );
-            is_processing.store(false, Ordering::Relaxed);
             return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock timeout too short\"}\r\n".to_string();
         }
 
@@ -431,7 +416,7 @@ impl<P> OffchainMarketMonitor<P> where
         tracing::info!("PRE-SEND PROCESSING TIME: {:.2}ms for request 0x{:x}",
             pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
 
-        // WebSocket ile raw transaction gönder
+        // Raw transaction gönder
         match Self::send_raw_transaction(
             &order_data,
             signer,
@@ -451,12 +436,10 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(Some(block)) => block.header.timestamp,
                     Ok(None) => {
                         tracing::error!("CRITICAL: Block {} not found after successful lock!", lock_block);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Block not found\"}\r\n".to_string();
                     }
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to get block {} after successful lock: {:?}", lock_block, e);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get block\"}\r\n".to_string();
                     }
                 };
@@ -466,14 +449,13 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(price) => price,
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to calculate lock price after successful lock: {:?}", e);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate price\"}\r\n".to_string();
                     }
                 };
 
                 tracing::info!("Lock successful for request 0x{:x}, price: {}, block: {}",
                              request_id, lock_price, lock_block);
-                is_processing.store(false, Ordering::Relaxed);
+
                 return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
             }
             Err(err) => {
@@ -492,12 +474,10 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(Some(block)) => block.header.timestamp,
                             Ok(None) => {
                                 tracing::error!("CRITICAL: Lock block {} not found!", lock_block);
-                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock block not found\"}\r\n".to_string();
                             }
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to get lock block {}: {:?}", lock_block, e);
-                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get lock block\"}\r\n".to_string();
                             }
                         };
@@ -506,51 +486,42 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(price) => price,
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to calculate lock price for block {}: {:?}", lock_block, e);
-                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate lock price\"}\r\n".to_string();
                             }
                         };
 
                         tracing::info!("Our transaction was successful, request 0x{:x} locked at block {} with price {}",
                                      request_id, lock_block, lock_price);
-                        is_processing.store(false, Ordering::Relaxed);
+
                         return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
                     }
                     Ok((false, true, _)) => {
                         // Başkası lock'ladı - skipped
                         tracing::info!("Request 0x{:x} locked by someone else - skipping", request_id);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Locked by someone else\"}\r\n".to_string();
                     }
                     Ok((_, false, _)) => {
                         // Lock yok - gerçekten başarısız
                         tracing::info!("Request 0x{:x} confirmed NOT locked", request_id);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Transaction failed\"}\r\n".to_string();
                     }
                     Ok((true, true, None)) => {
                         // Bizim transaction başarılı VE request locked + block numarası gelmedi
                         tracing::info!("true, true, None : Request 0x{:x} confirmed NOT locked", request_id);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"No lock block found\"}\r\n".to_string();
                     }
                     Err(check_err) => {
                         tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id, check_err);
-                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Status check failed\"}\r\n".to_string();
                     }
                 }
             }
         }
-    }
 
-    // JSON'dan order data parse et
-    fn parse_order_from_json(json: &serde_json::Value) -> Result<boundless_market::order_stream_client::OrderData, anyhow::Error> {
-        // Bu fonksiyonu gerçek order data structure'a göre implement etmeniz gerekiyor
-        // Şimdilik placeholder
-        todo!("Implement JSON to OrderData parsing")
+        tracing::info!("Transaction processing completed for request: 0x{:x}", request_id);
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"completed\"}\r\n".to_string()
     }
-
+    
     // Bizim transaction'ımızı kontrol et ve lock durumunu da kontrol et
     async fn check_our_transaction_and_lock_status(
         provider: &Arc<P>,
@@ -661,18 +632,18 @@ impl<P> OffchainMarketMonitor<P> where
 
         let expected_tx_hash = tx_envelope.tx_hash();
 
-        // **HTTP İSTEK ZAMANINI ÖLÇME - Node.js'teki gibi**
+        // **HTTP İSTEK ZAMANINI ÖLÇME**
         let http_request_start = Instant::now();
 
-        // HTTP ile eth_sendRawTransaction - ESKİ PRIVATE TRANSACTION KODUNU DEĞİŞTİRİN
+        // HTTP ile eth_sendRawTransaction
         let rclient = reqwest::Client::new();
         let response = rclient
             .post(&config.http_rpc_url)
             .header("Content-Type", "application/json")
             .json(&json!({
             "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",  // SADECE BU DEĞİŞTİ!
-            "params": [format!("0x{}", hex::encode(&tx_encoded))],  // VE BU DEĞİŞTİ!
+            "method": "eth_sendRawTransaction",
+            "params": [format!("0x{}", hex::encode(&tx_encoded))],
             "id": 1
         }))
             .send()
