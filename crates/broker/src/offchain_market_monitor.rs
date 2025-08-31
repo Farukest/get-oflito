@@ -420,7 +420,6 @@ impl<P> OffchainMarketMonitor<P> where
         tracing::info!("PRE-SEND PROCESSING TIME: {:.2}ms for request 0x{:x}",
        pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
 
-        // Raw transaction gönder
         match Self::send_raw_transaction(
             &order_data,
             signer,
@@ -458,136 +457,17 @@ impl<P> OffchainMarketMonitor<P> where
                 };
 
                 tracing::info!("Lock successful for request 0x{:x}, price: {}, block: {}",
-                        request_id, lock_price, lock_block);
+                     request_id, lock_price, lock_block);
 
                 format!(r#"{{"status":"success","lock_block":{}}}"#, lock_block)
             }
             Err(err) => {
                 tracing::error!("Transaction error for request: 0x{:x}, error: {}", request_id, err);
-
-                // Transaction durumunu kontrol et
-                match Self::check_our_transaction_and_lock_status(provider, signer, contract_address, request_id).await {
-                    Ok((true, true, Some(lock_block))) => {
-                        // Bizim transaction başarılı VE request locked + block numarası var
-                        tracing::warn!("Transaction error occurred, but OUR transaction was successful for 0x{:x} at block {}!", request_id, lock_block);
-
-                        let lock_timestamp = match provider
-                            .get_block_by_number(lock_block.into())
-                            .await
-                        {
-                            Ok(Some(block)) => block.header.timestamp,
-                            Ok(None) => {
-                                tracing::error!("CRITICAL: Lock block {} not found!", lock_block);
-                                return r#"{"error":"Lock block not found"}"#.to_string();
-                            }
-                            Err(e) => {
-                                tracing::error!("CRITICAL: Failed to get lock block {}: {:?}", lock_block, e);
-                                return r#"{"error":"Failed to get lock block"}"#.to_string();
-                            }
-                        };
-
-                        let lock_price = match order_data.order.request.offer.price_at(lock_timestamp) {
-                            Ok(price) => price,
-                            Err(e) => {
-                                tracing::error!("CRITICAL: Failed to calculate lock price for block {}: {:?}", lock_block, e);
-                                return r#"{"error":"Failed to calculate lock price"}"#.to_string();
-                            }
-                        };
-
-                        tracing::info!("Our transaction was successful, request 0x{:x} locked at block {} with price {}",
-                                request_id, lock_block, lock_price);
-
-                        format!(r#"{{"status":"success","lock_block":{}}}"#, lock_block)
-                    }
-                    Ok((false, true, _)) => {
-                        // Başkası lock'ladı - skipped
-                        tracing::info!("Request 0x{:x} locked by someone else - skipping", request_id);
-                        r#"{"error":"Locked by someone else"}"#.to_string()
-                    }
-                    Ok((_, false, _)) => {
-                        // Lock yok - gerçekten başarısız
-                        tracing::info!("Request 0x{:x} confirmed NOT locked", request_id);
-                        r#"{"error":"Transaction failed"}"#.to_string()
-                    }
-                    Ok((true, true, None)) => {
-                        // Bizim transaction başarılı VE request locked + block numarası gelmedi
-                        tracing::info!("true, true, None : Request 0x{:x} confirmed NOT locked", request_id);
-                        r#"{"error":"No lock block found"}"#.to_string()
-                    }
-                    Err(check_err) => {
-                        tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id, check_err);
-                        r#"{"error":"Status check failed"}"#.to_string()
-                    }
-                }
+                r#"{"error":"Transaction failed"}"#.to_string()
             }
         }
     }
 
-    // Bizim transaction'ımızı kontrol et ve lock durumunu da kontrol et
-    async fn check_our_transaction_and_lock_status(
-        provider: &Arc<P>,
-        signer: &PrivateKeySigner,
-        contract_address: Address,
-        request_id: U256,
-    ) -> Result<(bool, bool, Option<u64>), anyhow::Error> {
-        // İlk önce request locked mı kontrol et
-        let call = IBoundlessMarket::requestIsLockedCall {
-            requestId: request_id
-        };
-
-        let call_request = alloy::rpc::types::TransactionRequest::default()
-            .to(contract_address)
-            .input(call.abi_encode().into());
-
-        let result = provider.call(call_request).await
-            .context("Failed to call requestIsLocked")?;
-
-        let is_locked = IBoundlessMarket::requestIsLockedCall::abi_decode_returns(&result)
-            .context("Failed to decode requestIsLocked result")?;
-
-        tracing::debug!("Request 0x{:x} lock status: {}", request_id, is_locked);
-
-        if !is_locked {
-            // Request locked değil - bizim transaction da başarısız demek
-            return Ok((false, false, None));
-        }
-
-        // Request locked - ama bizim transaction mı başkasının mı kontrol et
-        // Son birkaç bloktaki bizim adresimizden gelen transaction'ları kontrol et
-        let current_block = provider.get_block_number().await
-            .context("Failed to get current block number")?;
-
-        // Son 50 blok içinde bizim transaction'ımızı ara
-        let start_block = current_block.saturating_sub(50);
-
-        for block_num in start_block..=current_block {
-            if let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).await {
-                for tx_hash in block.transactions.hashes() {
-                    let tx_hash_fixed = TxHash::from_slice(tx_hash.as_slice());
-
-                    if let Ok(Some(tx)) = provider.get_transaction_by_hash(tx_hash_fixed).await {
-                        // Transaction receipt'i al
-                        if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash_fixed).await {
-                            let tx_from = receipt.from;
-                            let tx_to = tx.to();
-
-                            // Bizim adresimizden mi ve contract'a mı gönderilmiş
-                            if tx_from == signer.address() && tx_to == Some(contract_address) {
-                                if receipt.status() {
-                                    let block_number = receipt.block_number.unwrap_or(block_num);
-                                    tracing::debug!("Found our successful transaction: 0x{} at block: {}", tx_hash_fixed, block_number);
-                                    return Ok((true, true, Some(block_number)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Bizim başarılı transaction bulamadık ama request locked - başkası yapmış
-        Ok((false, true, None))
-    }
 
     async fn send_raw_transaction(
         order_data: &boundless_market::order_stream_client::OrderData,
