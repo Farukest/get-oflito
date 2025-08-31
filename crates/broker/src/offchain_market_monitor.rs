@@ -315,18 +315,18 @@ impl<P> OffchainMarketMonitor<P> where
                     // Response gönder ama connection'ı KAPATMA
                     if let Err(e) = ws_stream.send(Message::Text(response)).await {
                         tracing::error!("Failed to send response: {}", e);
-                        break;
+                        // break;
                     }
 
                     // CONNECTION'I KAPATMA - while loop devam etsin
                 }
                 Ok(Message::Close(_)) => {
                     tracing::info!("Client closed connection");
-                    break;
+                    // break;
                 }
                 Err(e) => {
                     tracing::error!("WebSocket error: {}", e);
-                    break;
+                    // break;
                 }
                 _ => {
                     // Diğer message tiplerini ignore et
