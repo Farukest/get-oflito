@@ -80,6 +80,7 @@ pub struct OffchainMarketMonitor<P> {
     prover_addr: Address,
     provider: Arc<P>,
     config: ConfigLock,
+    market_addr: Address,
 }
 
 impl<P> OffchainMarketMonitor<P> where
@@ -90,12 +91,14 @@ impl<P> OffchainMarketMonitor<P> where
         prover_addr: Address,
         provider: Arc<P>,
         config_lock: ConfigLock,
+        market_addr: Address,
     ) -> Self {
         Self {
             signer,
             prover_addr,
             provider,
             config: config_lock,
+            market_addr
         }
     }
 
@@ -268,7 +271,7 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🎧 Offchain market monitor started on port {}", monitor_config.listen_port);
 
-        let mut is_processing = false;
+        let is_processing = Arc::new(AtomicBool::new(false));
 
         loop {
             tokio::select! {
@@ -278,7 +281,7 @@ impl<P> OffchainMarketMonitor<P> where
                             let signer = signer.clone();
                             let provider = provider.clone();
                             let config = monitor_config.clone();
-                            let is_processing_ref = &mut is_processing;
+                            let is_processing = is_processing.clone();
 
                             tokio::spawn(async move {
                                 let mut buffer = [0; 4096];
@@ -292,7 +295,7 @@ impl<P> OffchainMarketMonitor<P> where
                                             &config,
                                             contract_address,
                                             prover_addr,
-                                            is_processing_ref,
+                                            &is_processing,
                                         ).await;
 
                                         if let Err(e) = socket.write_all(response.as_bytes()).await {
@@ -329,7 +332,7 @@ impl<P> OffchainMarketMonitor<P> where
         config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
-        is_processing: &mut bool,
+        is_processing: &Arc<AtomicBool>,
     ) -> String {
         // Basit HTTP parsing
         let lines: Vec<&str> = request.lines().collect();
@@ -364,14 +367,14 @@ impl<P> OffchainMarketMonitor<P> where
         config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
-        is_processing: &mut bool,
+        is_processing: &Arc<AtomicBool>,
     ) -> String {
         // Eğer committed orders bekleme modundaysak order processing yapma
         if IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed) {
             return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"waiting_for_committed_orders\"}\r\n".to_string();
         }
 
-        if *is_processing {
+        if is_processing.load(Ordering::Relaxed) {
             tracing::warn!("Zaten bir transaction işleniyor, yeni order beklemede...");
             return "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Already processing\"}\r\n".to_string();
         }
@@ -393,7 +396,7 @@ impl<P> OffchainMarketMonitor<P> where
             }
         };
 
-        *is_processing = true;
+        is_processing.store(true, Ordering::Relaxed);
 
         let request_id = order_data.order.request.id;
         let client_addr = order_data.order.request.client_address();
@@ -402,7 +405,7 @@ impl<P> OffchainMarketMonitor<P> where
         if let Some(ref allow_addresses) = config.allowed_requestors {
             if !allow_addresses.contains(&client_addr) {
                 tracing::debug!("Client not in allowed requestors, skipping request: 0x{:x}", request_id);
-                *is_processing = false;
+                is_processing.store(false, Ordering::Relaxed);
                 return "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Client not allowed\"}\r\n".to_string();
             }
         }
@@ -419,7 +422,7 @@ impl<P> OffchainMarketMonitor<P> where
                 order_data.order.request.offer.lockTimeout,
                 config.min_allowed_lock_timeout_secs
             );
-            *is_processing = false;
+            is_processing.store(false, Ordering::Relaxed);
             return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock timeout too short\"}\r\n".to_string();
         }
 
@@ -448,12 +451,12 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(Some(block)) => block.header.timestamp,
                     Ok(None) => {
                         tracing::error!("CRITICAL: Block {} not found after successful lock!", lock_block);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Block not found\"}\r\n".to_string();
                     }
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to get block {} after successful lock: {:?}", lock_block, e);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get block\"}\r\n".to_string();
                     }
                 };
@@ -463,15 +466,15 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(price) => price,
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to calculate lock price after successful lock: {:?}", e);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate price\"}\r\n".to_string();
                     }
                 };
 
                 tracing::info!("Lock successful for request 0x{:x}, price: {}, block: {}",
                              request_id, lock_price, lock_block);
-                *is_processing = false;
-                return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"success\",\"lock_block\":" + &lock_block.to_string() + "}\r\n".to_string();
+                is_processing.store(false, Ordering::Relaxed);
+                return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
             }
             Err(err) => {
                 tracing::error!("Transaction error for request: 0x{:x}, error: {}", request_id, err);
@@ -489,12 +492,12 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(Some(block)) => block.header.timestamp,
                             Ok(None) => {
                                 tracing::error!("CRITICAL: Lock block {} not found!", lock_block);
-                                *is_processing = false;
+                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock block not found\"}\r\n".to_string();
                             }
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to get lock block {}: {:?}", lock_block, e);
-                                *is_processing = false;
+                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get lock block\"}\r\n".to_string();
                             }
                         };
@@ -503,37 +506,37 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(price) => price,
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to calculate lock price for block {}: {:?}", lock_block, e);
-                                *is_processing = false;
+                                is_processing.store(false, Ordering::Relaxed);
                                 return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate lock price\"}\r\n".to_string();
                             }
                         };
 
                         tracing::info!("Our transaction was successful, request 0x{:x} locked at block {} with price {}",
                                      request_id, lock_block, lock_price);
-                        *is_processing = false;
-                        return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"success\",\"lock_block\":" + &lock_block.to_string() + "}\r\n".to_string();
+                        is_processing.store(false, Ordering::Relaxed);
+                        return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
                     }
                     Ok((false, true, _)) => {
                         // Başkası lock'ladı - skipped
                         tracing::info!("Request 0x{:x} locked by someone else - skipping", request_id);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Locked by someone else\"}\r\n".to_string();
                     }
                     Ok((_, false, _)) => {
                         // Lock yok - gerçekten başarısız
                         tracing::info!("Request 0x{:x} confirmed NOT locked", request_id);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Transaction failed\"}\r\n".to_string();
                     }
                     Ok((true, true, None)) => {
                         // Bizim transaction başarılı VE request locked + block numarası gelmedi
                         tracing::info!("true, true, None : Request 0x{:x} confirmed NOT locked", request_id);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"No lock block found\"}\r\n".to_string();
                     }
                     Err(check_err) => {
                         tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id, check_err);
-                        *is_processing = false;
+                        is_processing.store(false, Ordering::Relaxed);
                         return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Status check failed\"}\r\n".to_string();
                     }
                 }
@@ -807,10 +810,11 @@ where
         let prover_addr = self.prover_addr;
         let provider = self.provider.clone();
         let config = self.config.clone();
+        let market_addr = self.market_addr;
 
         Box::pin(async move {
             tracing::info!("Starting up offchain market monitor");
-            Self::monitor_orders(signer, cancel_token, prover_addr, provider, config, /* contract_address burada gerekli */)
+            Self::monitor_orders(signer, cancel_token, prover_addr, provider, config, market_addr)
                 .await
                 .map_err(SupervisorErr::Recover)?;
             Ok(())

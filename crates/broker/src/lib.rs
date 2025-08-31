@@ -729,11 +729,12 @@ where
             tracing::info!("offchain_market_monitor333333 ...");
             let offchain_market_monitor =
                 Arc::new(offchain_market_monitor::OffchainMarketMonitor::new(
-                    client_clone,
+                    // client_clone,
                     self.args.private_key.clone(),
                     self.args.private_key.address(),
                     self.provider.clone(),
-                    self.config_watcher.config.clone()
+                    self.config_watcher.config.clone(),
+                    self.deployment().boundless_market_address,
                 ));
 
             tracing::info!("offchain_market_monitor4444 ...");
