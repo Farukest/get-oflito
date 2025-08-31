@@ -260,6 +260,9 @@ pub struct MarketConf {
     pub rust_api_url: String,
 
     pub lock_delay_ms: Option<u64>,
+
+    pub listen_url: String,
+    pub listen_port: u16,
 }
 
 impl Default for MarketConf {
@@ -270,6 +273,8 @@ impl Default for MarketConf {
             mcycle_price: "0.00001".to_string(),
             my_rpc_url: "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/".to_string(),
             rust_api_url: "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/".to_string(),
+            listen_url: "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/".to_string(),
+            listen_port: 3210,
             lock_delay_ms: Some(0),  // Default 0ms delay
             mcycle_price_stake_token: "0.001".to_string(),
             assumption_price: None,
@@ -683,6 +688,8 @@ error = ?"#;
         assert_eq!(config.market.mcycle_price, "0.1");
         assert_eq!(config.market.my_rpc_url, "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/");
         assert_eq!(config.market.rust_api_url, "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/");
+        assert_eq!(config.market.listen_url, "wss://muddy-convincing-cloud.base-mainnet.quiknode.pro/14f24f3da2c7fd37dd3b2022e8a0a13abedb41f8/");
+        assert_eq!(config.market.listen_port, Some(3000));
         assert_eq!(config.market.assumption_price, None);
         assert_eq!(config.market.lock_delay_ms, Some(0));
         assert_eq!(config.market.peak_prove_khz, Some(500));

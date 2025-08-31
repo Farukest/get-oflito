@@ -230,7 +230,7 @@ impl<P> OffchainMarketMonitor<P> where
         let monitor_config = {
             let locked_conf = config.lock_all().context("Failed to read config")?;
             MonitorConfig {
-                listen_port: locked_conf.listener.listen_port,
+                listen_port: locked_conf.market.listen_port,
                 rust_api_url: locked_conf.market.rust_api_url.clone(),
                 allowed_requestors: locked_conf.market.allow_requestor_addresses.clone(),
                 lockin_priority_gas: locked_conf.market.lockin_priority_gas.unwrap_or(5000000),
