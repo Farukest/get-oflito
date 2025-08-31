@@ -338,7 +338,6 @@ impl<P> OffchainMarketMonitor<P> where
 
 
 
-    // Order'ı işle
     async fn process_order_ws(
         body: String,
         signer: &PrivateKeySigner,
@@ -347,11 +346,12 @@ impl<P> OffchainMarketMonitor<P> where
         contract_address: Address,
         prover_addr: Address,
     ) -> String {
-        // Mevcut process_order logic'ini kullan, sadece JSON response döndür
+        // Committed orders bekliyorsa
         if IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed) {
             return r#"{"status":"waiting_for_committed_orders"}"#.to_string();
         }
 
+        // Order data parse et
         let order_data: boundless_market::order_stream_client::OrderData = match serde_json::from_str(&body) {
             Ok(data) => data,
             Err(e) => {
@@ -367,29 +367,29 @@ impl<P> OffchainMarketMonitor<P> where
         if let Some(ref allow_addresses) = config.allowed_requestors {
             if !allow_addresses.contains(&client_addr) {
                 tracing::debug!("Client not in allowed requestors, skipping request: 0x{:x}", request_id);
-                return "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Client not allowed\"}\r\n".to_string();
+                return r#"{"error":"Client not allowed"}"#.to_string();
             }
         }
 
-        // **ORDER ID ALINDI - TIMING BAŞLAT**
+        // Order ID alındı - timing başlat
         let order_received_time = Instant::now();
         tracing::info!("ORDER RECEIVED - Request ID: 0x{:x} at {}", request_id, Self::format_time(chrono::Utc::now()));
 
         // Lock timeout kontrolü
         if (order_data.order.request.offer.lockTimeout as u64) < config.min_allowed_lock_timeout_secs {
             tracing::info!(
-                "Skipping order {}: Lock Timeout ({} seconds) is less than minimum required ({} seconds).",
-                order_data.order.request.id,
-                order_data.order.request.offer.lockTimeout,
-                config.min_allowed_lock_timeout_secs
-            );
-            return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock timeout too short\"}\r\n".to_string();
+           "Skipping order {}: Lock Timeout ({} seconds) is less than minimum required ({} seconds).",
+           order_data.order.request.id,
+           order_data.order.request.offer.lockTimeout,
+           config.min_allowed_lock_timeout_secs
+       );
+            return r#"{"error":"Lock timeout too short"}"#.to_string();
         }
 
-        // **RAW TRANSACTION GÖNDERİM ÖNCESİ SÜRE HESAPLA**
+        // Pre-send processing time ölç
         let pre_send_elapsed = order_received_time.elapsed();
         tracing::info!("PRE-SEND PROCESSING TIME: {:.2}ms for request 0x{:x}",
-            pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
+       pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
 
         // Raw transaction gönder
         match Self::send_raw_transaction(
@@ -411,11 +411,11 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(Some(block)) => block.header.timestamp,
                     Ok(None) => {
                         tracing::error!("CRITICAL: Block {} not found after successful lock!", lock_block);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Block not found\"}\r\n".to_string();
+                        return r#"{"error":"Block not found"}"#.to_string();
                     }
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to get block {} after successful lock: {:?}", lock_block, e);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get block\"}\r\n".to_string();
+                        return r#"{"error":"Failed to get block"}"#.to_string();
                     }
                 };
 
@@ -424,19 +424,19 @@ impl<P> OffchainMarketMonitor<P> where
                     Ok(price) => price,
                     Err(e) => {
                         tracing::error!("CRITICAL: Failed to calculate lock price after successful lock: {:?}", e);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate price\"}\r\n".to_string();
+                        return r#"{"error":"Failed to calculate price"}"#.to_string();
                     }
                 };
 
                 tracing::info!("Lock successful for request 0x{:x}, price: {}, block: {}",
-                             request_id, lock_price, lock_block);
+                        request_id, lock_price, lock_block);
 
-                return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
+                format!(r#"{{"status":"success","lock_block":{}}}"#, lock_block)
             }
             Err(err) => {
                 tracing::error!("Transaction error for request: 0x{:x}, error: {}", request_id, err);
 
-                // Bizim tx kontrolü ve block numarası al
+                // Transaction durumunu kontrol et
                 match Self::check_our_transaction_and_lock_status(provider, signer, contract_address, request_id).await {
                     Ok((true, true, Some(lock_block))) => {
                         // Bizim transaction başarılı VE request locked + block numarası var
@@ -449,11 +449,11 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(Some(block)) => block.header.timestamp,
                             Ok(None) => {
                                 tracing::error!("CRITICAL: Lock block {} not found!", lock_block);
-                                return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Lock block not found\"}\r\n".to_string();
+                                return r#"{"error":"Lock block not found"}"#.to_string();
                             }
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to get lock block {}: {:?}", lock_block, e);
-                                return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to get lock block\"}\r\n".to_string();
+                                return r#"{"error":"Failed to get lock block"}"#.to_string();
                             }
                         };
 
@@ -461,40 +461,37 @@ impl<P> OffchainMarketMonitor<P> where
                             Ok(price) => price,
                             Err(e) => {
                                 tracing::error!("CRITICAL: Failed to calculate lock price for block {}: {:?}", lock_block, e);
-                                return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Failed to calculate lock price\"}\r\n".to_string();
+                                return r#"{"error":"Failed to calculate lock price"}"#.to_string();
                             }
                         };
 
                         tracing::info!("Our transaction was successful, request 0x{:x} locked at block {} with price {}",
-                                     request_id, lock_block, lock_price);
+                                request_id, lock_block, lock_price);
 
-                        return format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"status\":\"success\",\"lock_block\":{}}}\r\n", lock_block);
+                        format!(r#"{{"status":"success","lock_block":{}}}"#, lock_block)
                     }
                     Ok((false, true, _)) => {
                         // Başkası lock'ladı - skipped
                         tracing::info!("Request 0x{:x} locked by someone else - skipping", request_id);
-                        return "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Locked by someone else\"}\r\n".to_string();
+                        r#"{"error":"Locked by someone else"}"#.to_string()
                     }
                     Ok((_, false, _)) => {
                         // Lock yok - gerçekten başarısız
                         tracing::info!("Request 0x{:x} confirmed NOT locked", request_id);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Transaction failed\"}\r\n".to_string();
+                        r#"{"error":"Transaction failed"}"#.to_string()
                     }
                     Ok((true, true, None)) => {
                         // Bizim transaction başarılı VE request locked + block numarası gelmedi
                         tracing::info!("true, true, None : Request 0x{:x} confirmed NOT locked", request_id);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"No lock block found\"}\r\n".to_string();
+                        r#"{"error":"No lock block found"}"#.to_string()
                     }
                     Err(check_err) => {
                         tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id, check_err);
-                        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Status check failed\"}\r\n".to_string();
+                        r#"{"error":"Status check failed"}"#.to_string()
                     }
                 }
             }
         }
-
-        tracing::info!("Transaction processing completed for request: 0x{:x}", request_id);
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"completed\"}\r\n".to_string()
     }
 
     // Bizim transaction'ımızı kontrol et ve lock durumunu da kontrol et
