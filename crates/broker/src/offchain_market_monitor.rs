@@ -282,19 +282,21 @@ impl<P> OffchainMarketMonitor<P> where
                         let provider = provider.clone();
                         let config = monitor_config.clone();
 
-                        tokio::spawn(async move {
-                            match tokio_tungstenite::accept_async(stream).await {
-                                Ok(ws_stream) => {
-                                    Self::handle_websocket_connection(
-                                        ws_stream, &signer, &provider, &config,
-                                        market_addr, prover_addr
-                                    ).await;
+                            tokio::spawn(async move {
+                                tracing::info!("New TCP connection accepted");
+                                match tokio_tungstenite::accept_async(stream).await {
+                                    Ok(ws_stream) => {
+                                        tracing::info!("WebSocket handshake successful");
+                                        Self::handle_websocket_connection(
+                                            ws_stream, &signer, &provider, &config,
+                                            market_addr, prover_addr
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("WebSocket handshake failed: {:?}", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::error!("WebSocket handshake failed: {}", e);
-                                }
-                            }
-                        });
+                            });
                     }
                     Err(e) => {
                         tracing::warn!("Failed to accept connection: {}", e);
