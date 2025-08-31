@@ -326,9 +326,22 @@ impl<P> OffchainMarketMonitor<P> where
                         contract_address, prover_addr
                     ).await;
 
-                    let _ = ws_stream.send(Message::Text(response)).await;
+                    // Response gönder
+                    if let Err(e) = ws_stream.send(Message::Text(response)).await {
+                        tracing::error!("Failed to send response: {}", e);
+                        break;
+                    }
+
+                    // Connection'ı düzgün kapat
+                    if let Err(e) = ws_stream.send(Message::Close(None)).await {
+                        tracing::error!("Failed to send close frame: {}", e);
+                    }
+                    break; // Tek message işledikten sonra connection'ı kapat
                 }
-                Ok(Message::Close(_)) => break,
+                Ok(Message::Close(_)) => {
+                    tracing::info!("Client closed connection");
+                    break;
+                }
                 Err(e) => {
                     tracing::error!("WebSocket error: {}", e);
                     break;
