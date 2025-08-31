@@ -266,35 +266,30 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🎧 WebSocket server started on port {}", monitor_config.listen_port);
 
-        // SADECE İLK CONNECTION'I KABUL ET
-        tokio::select! {
-        result = listener.accept() => {
-            match result {
-                Ok((stream, _)) => {
-                    tracing::info!("Accepting first TCP connection");
-                    match tokio_tungstenite::accept_async(stream).await {
-                        Ok(ws_stream) => {
-                            tracing::info!("WebSocket handshake successful - starting persistent handler");
-                            Self::handle_websocket_connection(
-                                ws_stream, &signer, &provider, &monitor_config,
-                                market_addr, prover_addr
-                            ).await;
-                        }
-                        Err(e) => {
-                            tracing::error!("WebSocket handshake failed: {:?}", e);
-                            return Err(OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!("Handshake failed: {}", e)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to accept connection: {}", e)));
-                }
+        // SELECT KALDIR - DİREKT ACCEPT ET
+        let (stream, _) = tokio::select! {
+            result = listener.accept() => {
+                result.map_err(|e| OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to accept: {}", e)))?
             }
+            _ = cancel_token.cancelled() => {
+                return Ok(());
+            }
+        };
+
+        tracing::info!("Accepting persistent TCP connection");
+        let ws_stream = tokio_tungstenite::accept_async(stream).await
+            .map_err(|e| OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!("Handshake failed: {}", e)))?;
+
+        tracing::info!("WebSocket handshake successful - starting persistent handler");
+
+        // CANCEL TOKEN İLE BİRLİKTE HANDLERİ ÇALIŞTIR
+        tokio::select! {
+            _ = Self::handle_websocket_connection(
+                ws_stream, &signer, &provider, &monitor_config,
+                market_addr, prover_addr
+            ) => {}
+            _ = cancel_token.cancelled() => {}
         }
-        _ = cancel_token.cancelled() => {
-            return Ok(());
-        }
-    }
 
         Ok(())
     }
