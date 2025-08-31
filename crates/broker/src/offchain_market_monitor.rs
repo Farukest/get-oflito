@@ -43,6 +43,9 @@ pub enum OffchainMarketMonitorErr {
     #[error("Server error: {0:?}")]
     ServerErr(anyhow::Error),
 
+    #[error("Websocket error: {0:?}")]
+    WebSocketErr(anyhow::Error),
+
     #[error("{code} Receiver dropped", code = self.code())]
     ReceiverDropped,
 
@@ -56,6 +59,7 @@ impl CodedError for OffchainMarketMonitorErr {
     fn code(&self) -> &str {
         match self {
             OffchainMarketMonitorErr::ServerErr(_) => "[B-OMM-001]",
+            OffchainMarketMonitorErr::WebSocketErr(_) => "[B-OMM-001]",
             OffchainMarketMonitorErr::ReceiverDropped => "[B-OMM-002]",
             OffchainMarketMonitorErr::UnexpectedErr(_) => "[B-OMM-500]",
         }
@@ -244,27 +248,16 @@ impl<P> OffchainMarketMonitor<P> where
             }
         };
 
-        // Chain ID ve initial nonce'u cache'le
+        // Cache initialization...
         let chain_id = 8453u64;
         CACHED_CHAIN_ID.store(chain_id, Ordering::Relaxed);
-
-        let initial_nonce = provider
-            .get_transaction_count(signer.address())
-            .pending()
-            .await
-            .context("Failed to get transaction count")?;
-
+        let initial_nonce = provider.get_transaction_count(signer.address()).pending().await.context("Failed to get transaction count")?;
         CURRENT_NONCE.store(initial_nonce, Ordering::Relaxed);
-
-        tracing::info!("Cache initialized - ChainId: {}, Initial Nonce: {}", chain_id, initial_nonce);
 
         // Committed orders polling'i başlat
         Self::start_committed_orders_polling(monitor_config.rust_api_url.clone()).await
             .map_err(|e| OffchainMarketMonitorErr::UnexpectedErr(e))?;
 
-        tracing::info!("🔄 Committed orders polling initialized");
-
-        // WebSocket server başlat
         let addr: SocketAddr = format!("0.0.0.0:{}", monitor_config.listen_port).parse()
             .map_err(|e| OffchainMarketMonitorErr::UnexpectedErr(anyhow::anyhow!("Invalid address: {}", e)))?;
 
@@ -273,41 +266,37 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🎧 WebSocket server started on port {}", monitor_config.listen_port);
 
-        loop {
-            tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        let signer = signer.clone();
-                        let provider = provider.clone();
-                        let config = monitor_config.clone();
-
-                            tokio::spawn(async move {
-                                tracing::info!("New TCP connection accepted");
-                                match tokio_tungstenite::accept_async(stream).await {
-                                    Ok(ws_stream) => {
-                                        tracing::info!("WebSocket handshake successful");
-                                        Self::handle_websocket_connection(
-                                            ws_stream, &signer, &provider, &config,
-                                            market_addr, prover_addr
-                                        ).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("WebSocket handshake failed: {:?}", e);
-                                    }
-                                }
-                            });
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to accept connection: {}", e);
+        // SADECE İLK CONNECTION'I KABUL ET
+        tokio::select! {
+        result = listener.accept() => {
+            match result {
+                Ok((stream, _)) => {
+                    tracing::info!("Accepting first TCP connection");
+                    match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws_stream) => {
+                            tracing::info!("WebSocket handshake successful - starting persistent handler");
+                            Self::handle_websocket_connection(
+                                ws_stream, &signer, &provider, &monitor_config,
+                                market_addr, prover_addr
+                            ).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("WebSocket handshake failed: {:?}", e);
+                            return Err(OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!("Handshake failed: {}", e)));
+                        }
                     }
                 }
-            }
-            _ = cancel_token.cancelled() => {
-                return Ok(());
+                Err(e) => {
+                    return Err(OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to accept connection: {}", e)));
+                }
             }
         }
+        _ = cancel_token.cancelled() => {
+            return Ok(());
         }
+    }
+
+        Ok(())
     }
 
     async fn handle_websocket_connection(
@@ -318,36 +307,23 @@ impl<P> OffchainMarketMonitor<P> where
         contract_address: Address,
         prover_addr: Address,
     ) {
-        tracing::info!("Starting to listen for WebSocket messages");
+        tracing::info!("Starting persistent WebSocket message handler");
 
         while let Some(msg) = ws_stream.next().await {
-            tracing::info!("Received WebSocket message: {:?}", msg);
-
             match msg {
                 Ok(Message::Text(text)) => {
-                    tracing::info!("Processing text message of length: {}", text.len());
-
                     let response = Self::process_order_ws(
                         text, signer, provider, config,
                         contract_address, prover_addr
                     ).await;
 
-                    tracing::info!("Generated response: {}", response);
-
-                    // Response gönder
+                    // Response gönder ama connection'ı KAPATMA
                     if let Err(e) = ws_stream.send(Message::Text(response)).await {
                         tracing::error!("Failed to send response: {}", e);
                         break;
                     }
 
-                    tracing::info!("Response sent successfully");
-
-                    // Connection'ı düzgün kapat
-                    if let Err(e) = ws_stream.send(Message::Close(None)).await {
-                        tracing::error!("Failed to send close frame: {}", e);
-                    }
-                    tracing::info!("Close frame sent");
-                    break;
+                    // CONNECTION'I KAPATMA - while loop devam etsin
                 }
                 Ok(Message::Close(_)) => {
                     tracing::info!("Client closed connection");
@@ -358,12 +334,12 @@ impl<P> OffchainMarketMonitor<P> where
                     break;
                 }
                 _ => {
-                    tracing::info!("Received other message type");
+                    // Diğer message tiplerini ignore et
                 }
             }
         }
 
-        tracing::info!("WebSocket connection handler finished");
+        tracing::info!("WebSocket connection closed");
     }
 
 
