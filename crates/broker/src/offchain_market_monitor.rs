@@ -37,6 +37,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
+use once_cell::sync::Lazy;
+
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(900))
+        .timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(900))
+        .build()
+        .expect("Failed to create HTTP client")
+});
 
 #[derive(Error)]
 pub enum OffchainMarketMonitorErr {
@@ -525,16 +536,15 @@ impl<P> OffchainMarketMonitor<P> where
         let http_request_start = Instant::now();
 
         // HTTP ile eth_sendRawTransaction
-        let rclient = reqwest::Client::new();
-        let response = rclient
+        let response = HTTP_CLIENT  // KULLAN
             .post(&config.http_rpc_url)
             .header("Content-Type", "application/json")
             .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [format!("0x{}", hex::encode(&tx_encoded))],
-            "id": 1
-        }))
+                "jsonrpc": "2.0",
+                "method": "eth_sendRawTransaction",
+                "params": [format!("0x{}", hex::encode(&tx_encoded))],
+                "id": 1
+            }))
             .send()
             .await
             .context("Failed to send raw transaction request")?;
