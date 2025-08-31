@@ -2757,7 +2757,6 @@ dependencies = [
  "httpmock",
  "moka",
  "notify",
- "once_cell",
  "proptest",
  "proptest-derive",
  "rand 0.9.1",

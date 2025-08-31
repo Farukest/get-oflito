@@ -37,17 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
-use once_cell::sync::Lazy;
-
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Duration::from_secs(900))
-        .timeout(Duration::from_secs(30))
-        .tcp_keepalive(Duration::from_secs(900))
-        .build()
-        .expect("Failed to create HTTP client")
-});
+use tokio::sync::RwLock; // ✅ RwLock eklendi
 
 #[derive(Error)]
 pub enum OffchainMarketMonitorErr {
@@ -83,7 +73,55 @@ static CURRENT_NONCE: AtomicU64 = AtomicU64::new(0);
 static IS_WAITING_FOR_COMMITTED_ORDERS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
-pub struct MonitorConfig {
+struct OptimizedHttpClient {
+    client: reqwest::Client,
+    rpc_url: String,
+}
+
+impl OptimizedHttpClient {
+    fn new(rpc_url: String) -> Self {
+        // ✅ Connection pooling ve keep-alive ile optimize edilmiş client
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(30)           // Host başına max 30 idle connection
+            .pool_idle_timeout(Duration::from_secs(30))  // 30s sonra idle connection'ları kapat
+            .timeout(Duration::from_secs(1))      // Request timeout
+            .connect_timeout(Duration::from_millis(500))
+            .tcp_keepalive(Duration::from_secs(60)) // TCP keep-alive
+            .http2_keep_alive_interval(Some(Duration::from_secs(30))) // HTTP/2 keep-alive
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self { client, rpc_url }
+    }
+
+    // ✅ Hızlı raw transaction gönderme
+    async fn send_raw_transaction(&self, tx_encoded: &[u8]) -> Result<serde_json::Value> {
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_sendRawTransaction",
+            "params": [format!("0x{}", hex::encode(tx_encoded))],
+            "id": 1
+        });
+
+        let response = self.client
+            .post(&self.rpc_url)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .context("Failed to send raw transaction")?;
+
+        let result: serde_json::Value = response.json().await
+            .context("Failed to parse raw transaction response")?;
+
+        Ok(result)
+    }
+}
+
+#[derive(Clone)]
+struct CachedConfig {
     pub listen_port: u16,
     pub rust_api_url: String,
     pub allowed_requestors: Option<HashSet<Address>>,
@@ -96,8 +134,10 @@ pub struct OffchainMarketMonitor<P> {
     signer: PrivateKeySigner,
     prover_addr: Address,
     provider: Arc<P>,
-    config: ConfigLock,
     market_addr: Address,
+    http_client: OptimizedHttpClient,
+    cached_config: Arc<RwLock<CachedConfig>>, // ✅ Arc<RwLock<>> kullan
+    config: ConfigLock,
 }
 
 impl<P> OffchainMarketMonitor<P> where
@@ -110,13 +150,70 @@ impl<P> OffchainMarketMonitor<P> where
         config_lock: ConfigLock,
         market_addr: Address,
     ) -> Self {
+
+        // ✅ Config'i başlangıçta cache'le
+        let cached_config = {
+            let conf = config_lock.lock_all().context("Failed to read config during initialization").unwrap();
+            CachedConfig {
+                listen_port: conf.market.listen_port,
+                rust_api_url: conf.market.rust_api_url.clone(),
+                allowed_requestors: conf.market.allow_requestor_addresses.clone(),
+                lockin_priority_gas: conf.market.lockin_priority_gas.unwrap_or(5000000),
+                min_allowed_lock_timeout_secs: conf.market.min_lock_out_time * 60,
+                http_rpc_url: conf.market.my_rpc_url.clone(),
+            }
+        };
+
+        // ✅ Optimize edilmiş HTTP client oluştur
+        let http_client = OptimizedHttpClient::new(cached_config.http_rpc_url.clone());
+
         Self {
             signer,
             prover_addr,
             provider,
+            market_addr,
+            http_client,
+            cached_config: Arc::new(RwLock::new(cached_config)), // ✅ Arc<RwLock<>> wrap
             config: config_lock,
-            market_addr
         }
+    }
+
+    // ✅ Config'i güncelle ve yeni CachedConfig döndür
+    async fn update_cached_config(config: &ConfigLock, cached_config: Arc<RwLock<CachedConfig>>) -> Result<()> {
+        // ✅ Config'i oku ve hemen değerleri clone'la, guard'ı drop et
+        let updated_config = {
+            let conf = config.lock_all().context("Failed to read config during update")?;
+            let config_data = CachedConfig {
+                listen_port: conf.market.listen_port,
+                rust_api_url: conf.market.rust_api_url.clone(),
+                allowed_requestors: conf.market.allow_requestor_addresses.clone(),
+                lockin_priority_gas: conf.market.lockin_priority_gas.unwrap_or(5000000),
+                min_allowed_lock_timeout_secs: conf.market.min_lock_out_time * 60,
+                http_rpc_url: conf.market.my_rpc_url.clone(),
+            };
+
+            // Log için değerleri al
+            let allowed_requestors_exists = conf.market.allow_requestor_addresses.is_some();
+            let rpc_url = conf.market.my_rpc_url.clone();
+            let priority_gas = conf.market.lockin_priority_gas.unwrap_or(5000000);
+
+            // ✅ Guard burada drop olur
+            drop(conf);
+
+            tracing::info!("📖📖📖 CONFIG GÜNCELLENDI 📖📖📖");
+            tracing::info!("   - Allowed requestors: {:?}", allowed_requestors_exists);
+            tracing::info!("   - RPC URL: {}", rpc_url);
+            tracing::info!("   - Priority gas: {:?}", priority_gas);
+
+            config_data
+        };
+
+        // ✅ Artık guard yok, güvenle await yapabiliriz
+        let mut cached = cached_config.write().await;
+        *cached = updated_config;
+        drop(cached); // Explicit drop
+
+        Ok(())
     }
 
     fn format_time(dt: DateTime<Utc>) -> String {
@@ -205,7 +302,7 @@ impl<P> OffchainMarketMonitor<P> where
 
         let rust_api_url_clone = rust_api_url.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3 * 10)); // 3 dakika
+            let mut interval = tokio::time::interval(Duration::from_secs(3 * 60)); // 3 dakika
 
             loop {
                 interval.tick().await;
@@ -243,21 +340,11 @@ impl<P> OffchainMarketMonitor<P> where
         cancel_token: CancellationToken,
         prover_addr: Address,
         provider: Arc<P>,
-        config: ConfigLock,
         market_addr: Address,
+        http_client: OptimizedHttpClient,
+        cached_config: Arc<RwLock<CachedConfig>>, // ✅ Arc<RwLock<>> kullan
+        config: ConfigLock
     ) -> Result<(), OffchainMarketMonitorErr> {
-        // Config'i başta oku
-        let monitor_config = {
-            let locked_conf = config.lock_all().context("Failed to read config")?;
-            MonitorConfig {
-                listen_port: locked_conf.market.listen_port,
-                rust_api_url: locked_conf.market.rust_api_url.clone(),
-                allowed_requestors: locked_conf.market.allow_requestor_addresses.clone(),
-                lockin_priority_gas: locked_conf.market.lockin_priority_gas.unwrap_or(5000000),
-                min_allowed_lock_timeout_secs: locked_conf.market.min_lock_out_time * 60,
-                http_rpc_url: locked_conf.market.my_rpc_url.clone(),
-            }
-        };
 
         // Cache initialization...
         let chain_id = 8453u64;
@@ -265,78 +352,93 @@ impl<P> OffchainMarketMonitor<P> where
         let initial_nonce = provider.get_transaction_count(signer.address()).pending().await.context("Failed to get transaction count")?;
         CURRENT_NONCE.store(initial_nonce, Ordering::Relaxed);
 
+        // Rust API URL'ini cached_config'den al
+        let rust_api_url = {
+            let config_read = cached_config.read().await;
+            config_read.rust_api_url.clone()
+        };
+
         // Committed orders polling'i başlat
-        Self::start_committed_orders_polling(monitor_config.rust_api_url.clone()).await
+        Self::start_committed_orders_polling(rust_api_url).await
             .map_err(|e| OffchainMarketMonitorErr::UnexpectedErr(e))?;
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", monitor_config.listen_port).parse()
+        let listen_port = {
+            let config_read = cached_config.read().await;
+            config_read.listen_port
+        };
+
+        let addr: SocketAddr = format!("0.0.0.0:{}", listen_port).parse()
             .map_err(|e| OffchainMarketMonitorErr::UnexpectedErr(anyhow::anyhow!("Invalid address: {}", e)))?;
 
         let listener = TcpListener::bind(addr).await
             .map_err(|e| OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to bind: {}", e)))?;
 
-        tracing::info!("🎧 WebSocket server started on port {}", monitor_config.listen_port);
+        tracing::info!("🎧 WebSocket server started on port {}", listen_port);
 
         // SÜREKLI YENİ BAĞLANTILARI DİNLE
         loop {
             tokio::select! {
-            // Yeni bağlantı kabul et
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, client_addr)) => {
-                        tracing::info!("📞 New connection from: {}", client_addr);
+                // Yeni bağlantı kabul et
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, client_addr)) => {
+                            tracing::info!("📞 New connection from: {}", client_addr);
 
-                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws) => {
-                                tracing::info!("✅ WebSocket handshake successful with {}", client_addr);
-                                ws
-                            }
-                            Err(e) => {
-                                tracing::error!("❌ WebSocket handshake failed with {}: {}", client_addr, e);
-                                continue; // Bu bağlantıyı skip et, yenisini bekle
-                            }
-                        };
-
-                        // Her bağlantı için ayrı task spawn et
-                        let signer_clone = signer.clone();
-                        let provider_clone = provider.clone();
-                        let monitor_config_clone = monitor_config.clone();
-                        let cancel_token_clone = cancel_token.clone();
-
-                        tokio::spawn(async move {
-                            tracing::info!("🚀 Starting connection handler for {}", client_addr);
-
-                            tokio::select! {
-                                _ = Self::handle_websocket_connection(
-                                    ws_stream,
-                                    &signer_clone,
-                                    &provider_clone,
-                                    &monitor_config_clone,
-                                    market_addr,
-                                    prover_addr
-                                ) => {
-                                    tracing::info!("📴 Connection handler finished for {}", client_addr);
+                            let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                                Ok(ws) => {
+                                    tracing::info!("✅ WebSocket handshake successful with {}", client_addr);
+                                    ws
                                 }
-                                _ = cancel_token_clone.cancelled() => {
-                                    tracing::info!("🛑 Connection handler cancelled for {}", client_addr);
+                                Err(e) => {
+                                    tracing::error!("❌ WebSocket handshake failed with {}: {}", client_addr, e);
+                                    continue; // Bu bağlantıyı skip et, yenisini bekle
                                 }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("❌ Failed to accept connection: {}", e);
-                        // Error'da bile continue et, server'ı çökerme
-                        continue;
+                            };
+
+                            // Her bağlantı için ayrı task spawn et
+                            let signer_clone = signer.clone();
+                            let provider_clone = provider.clone();
+                            let cancel_token_clone = cancel_token.clone();
+                            let http_client_clone = http_client.clone();
+                            let cached_config_clone = cached_config.clone();
+                            let config_clone = config.clone();
+
+                            tokio::spawn(async move {
+                                tracing::info!("🚀 Starting connection handler for {}", client_addr);
+
+                                tokio::select! {
+                                    _ = Self::handle_websocket_connection(
+                                        ws_stream,
+                                        &signer_clone,
+                                        &provider_clone,
+                                        market_addr,
+                                        prover_addr,
+                                        &http_client_clone,
+                                        cached_config_clone, // ✅ Arc<RwLock<>> geçir
+                                        config_clone
+                                    ) => {
+                                        tracing::info!("📴 Connection handler finished for {}", client_addr);
+                                    }
+                                    _ = cancel_token_clone.cancelled() => {
+                                        tracing::info!("🛑 Connection handler cancelled for {}", client_addr);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("❌ Failed to accept connection: {}", e);
+                            // Error'da bile continue et, server'ı çökerme
+                            continue;
+                        }
                     }
                 }
-            }
 
-            // Cancel signal
-            _ = cancel_token.cancelled() => {
-                tracing::info!("🛑 Server shutdown requested");
-                break;
+                // Cancel signal
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("🛑 Server shutdown requested");
+                    break;
+                }
             }
-        }
         }
 
         Ok(())
@@ -346,9 +448,11 @@ impl<P> OffchainMarketMonitor<P> where
         mut ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         signer: &PrivateKeySigner,
         provider: &Arc<P>,
-        config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
+        http_client: &OptimizedHttpClient,
+        cached_config: Arc<RwLock<CachedConfig>>, // ✅ Arc<RwLock<>> kullan
+        config: ConfigLock
     ) {
         tracing::info!("Starting persistent WebSocket message handler");
 
@@ -356,25 +460,29 @@ impl<P> OffchainMarketMonitor<P> where
             match msg {
                 Ok(Message::Text(text)) => {
                     let response = Self::process_order_ws(
-                        text, signer, provider, config,
-                        contract_address, prover_addr
+                        text,
+                        signer,
+                        provider,
+                        contract_address,
+                        prover_addr,
+                        http_client,
+                        cached_config.clone(), // ✅ Arc clone
+                        config.clone()
                     ).await;
 
                     // Response gönder ama connection'ı KAPATMA
                     if let Err(e) = ws_stream.send(Message::Text(response)).await {
                         tracing::error!("Failed to send response: {}", e);
-                        // break;
+                        break; // Connection error'da çık
                     }
-
-                    // CONNECTION'I KAPATMA - while loop devam etsin
                 }
                 Ok(Message::Close(_)) => {
                     tracing::info!("Client closed connection");
-                    // break;
+                    break;
                 }
                 Err(e) => {
                     tracing::error!("WebSocket error: {}", e);
-                    // break;
+                    break;
                 }
                 _ => {
                     // Diğer message tiplerini ignore et
@@ -385,14 +493,15 @@ impl<P> OffchainMarketMonitor<P> where
         tracing::info!("WebSocket connection closed");
     }
 
-
     async fn process_order_ws(
         body: String,
         signer: &PrivateKeySigner,
         provider: &Arc<P>,
-        config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
+        http_client: &OptimizedHttpClient,
+        cached_config: Arc<RwLock<CachedConfig>>, // ✅ Arc<RwLock<>> kullan
+        config: ConfigLock
     ) -> String {
         // Committed orders bekliyorsa
         if IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed) {
@@ -411,11 +520,14 @@ impl<P> OffchainMarketMonitor<P> where
         let request_id = order_data.order.request.id;
         let client_addr = order_data.order.request.client_address();
 
-        // İzin verilen adres kontrolü
-        if let Some(ref allow_addresses) = config.allowed_requestors {
-            if !allow_addresses.contains(&client_addr) {
-                tracing::debug!("Client not in allowed requestors, skipping request: 0x{:x}", request_id);
-                return r#"{"error":"Client not allowed"}"#.to_string();
+        // ✅ İzin verilen adres kontrolü - read lock ile
+        {
+            let config_read = cached_config.read().await;
+            if let Some(ref allow_addresses) = config_read.allowed_requestors {
+                if !allow_addresses.contains(&client_addr) {
+                    tracing::debug!("Client not in allowed requestors, skipping request: 0x{:x}", request_id);
+                    return r#"{"error":"Client not allowed"}"#.to_string();
+                }
             }
         }
 
@@ -423,29 +535,34 @@ impl<P> OffchainMarketMonitor<P> where
         let order_received_time = Instant::now();
         tracing::info!("ORDER RECEIVED - Request ID: 0x{:x} at {}", request_id, Self::format_time(chrono::Utc::now()));
 
-        // Lock timeout kontrolü
-        if (order_data.order.request.offer.lockTimeout as u64) < config.min_allowed_lock_timeout_secs {
-            tracing::info!(
-           "Skipping order {}: Lock Timeout ({} seconds) is less than minimum required ({} seconds).",
-           order_data.order.request.id,
-           order_data.order.request.offer.lockTimeout,
-           config.min_allowed_lock_timeout_secs
-       );
-            return r#"{"error":"Lock timeout too short"}"#.to_string();
+        // ✅ Lock timeout kontrolü - read lock ile
+        {
+            let config_read = cached_config.read().await;
+            if (order_data.order.request.offer.lockTimeout as u64) < config_read.min_allowed_lock_timeout_secs {
+                tracing::info!(
+                    "Skipping order {}: Lock Timeout ({} seconds) is less than minimum required ({} seconds).",
+                    order_data.order.request.id,
+                    order_data.order.request.offer.lockTimeout,
+                    config_read.min_allowed_lock_timeout_secs
+                );
+                return r#"{"error":"Lock timeout too short"}"#.to_string();
+            }
         }
 
         // Pre-send processing time ölç
         let pre_send_elapsed = order_received_time.elapsed();
         tracing::info!("PRE-SEND PROCESSING TIME: {:.2}ms for request 0x{:x}",
-       pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
+            pre_send_elapsed.as_secs_f64() * 1000.0, request_id);
 
         match Self::send_raw_transaction(
             &order_data,
             signer,
             contract_address,
-            config,
             prover_addr,
             provider.clone(),
+            http_client,
+            cached_config.clone(), // ✅ Arc clone
+            config
         ).await {
             Ok(lock_block) => {
                 tracing::info!("LOCK SUCCESS! Request: 0x{:x}, Block: {}", request_id, lock_block);
@@ -487,14 +604,15 @@ impl<P> OffchainMarketMonitor<P> where
         }
     }
 
-
     async fn send_raw_transaction(
         order_data: &boundless_market::order_stream_client::OrderData,
         signer: &PrivateKeySigner,
         contract_address: Address,
-        config: &MonitorConfig,
         prover_addr: Address,
         provider: Arc<P>,
+        http_client: &OptimizedHttpClient,
+        cached_config: Arc<RwLock<CachedConfig>>, // ✅ Arc<RwLock<>> kullan
+        config: ConfigLock,
     ) -> Result<u64, anyhow::Error> {
         let chain_id = CACHED_CHAIN_ID.load(Ordering::Relaxed);
         let current_nonce = CURRENT_NONCE.load(Ordering::Relaxed);
@@ -507,7 +625,12 @@ impl<P> OffchainMarketMonitor<P> where
 
         let lock_calldata = lock_call.abi_encode();
 
-        let max_priority_fee_per_gas = config.lockin_priority_gas.into();
+        // ✅ Gas values'ları read lock ile al
+        let (max_priority_fee_per_gas, rust_api_url) = {
+            let config_read = cached_config.read().await;
+            (config_read.lockin_priority_gas.into(), config_read.rust_api_url.clone())
+        };
+
         let min_competitive_gas = 60_000_000u128;
         let base_fee = min_competitive_gas;
         let max_fee_per_gas = base_fee + max_priority_fee_per_gas;
@@ -532,29 +655,12 @@ impl<P> OffchainMarketMonitor<P> where
 
         let expected_tx_hash = tx_envelope.tx_hash();
 
-        // **HTTP İSTEK ZAMANINI ÖLÇME**
-        let http_request_start = Instant::now();
-
-        // HTTP ile eth_sendRawTransaction
-        let response = HTTP_CLIENT  // KULLAN
-            .post(&config.http_rpc_url)
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "eth_sendRawTransaction",
-                "params": [format!("0x{}", hex::encode(&tx_encoded))],
-                "id": 1
-            }))
-            .send()
-            .await
-            .context("Failed to send raw transaction request")?;
-
-        let http_request_elapsed = http_request_start.elapsed();
-        tracing::info!("HTTP REQUEST TIME (Base Sequencer Response Time): {:.2}ms for request 0x{:x}",
-        http_request_elapsed.as_secs_f64() * 1000.0, order_data.order.request.id);
-
-        let result: serde_json::Value = response.json().await
-            .context("Failed to parse response JSON")?;
+        tracing::info!("------- SENDING NOW ------");
+        // ✅ Optimize edilmiş HTTP client kullan - connection pooling ile
+        let send_start = Instant::now();
+        let result = http_client.send_raw_transaction(&tx_encoded).await?;
+        let send_duration = send_start.elapsed();
+        tracing::info!("🚀 Raw TX send duration: {:?}", send_duration);
 
         if let Some(error) = result.get("error") {
             let error_message = error.to_string().to_lowercase();
@@ -602,14 +708,19 @@ impl<P> OffchainMarketMonitor<P> where
         let lock_block = tx_receipt.block_number
             .ok_or_else(|| anyhow::anyhow!("No block number in receipt"))?;
 
-        tracing::info!("\x1b[32mİşlem {} başarıyla onaylandı. Lock alındı. Block: {}\x1b[0m", tx_hash, lock_block);
+        tracing::info!("İşlem {} başarıyla onaylandı. Lock alındı. Block: {}", tx_hash, lock_block);
 
         // Rust API'ye lock verilerini gönder
         tracing::info!("🦀 Rust API'ye lock verilerini gönderme başlatılıyor...");
 
-        match Self::send_to_rust_api(&config.rust_api_url, tx_hash.clone(), lock_block).await {
+        match Self::send_to_rust_api(&rust_api_url, tx_hash.clone(), lock_block).await {
             Ok(true) => {
                 tracing::info!("✅ Rust API'ye başarıyla veri gönderildi. Artık committed orders polling'e geçiliyor...");
+
+                // ✅ Config'i güncelle - async fn olarak
+                if let Err(e) = Self::update_cached_config(&config, cached_config.clone()).await {
+                    tracing::error!("❌ Failed to update cached_config: {:?}", e);
+                }
 
                 // Artık order monitoring'i durdur ve committed orders polling'i başlat
                 IS_WAITING_FOR_COMMITTED_ORDERS.store(true, Ordering::Relaxed);
@@ -679,12 +790,23 @@ where
         let signer = self.signer.clone();
         let prover_addr = self.prover_addr;
         let provider = self.provider.clone();
-        let config = self.config.clone();
         let market_addr = self.market_addr;
+        let cached_config = self.cached_config.clone(); // ✅ Arc clone - sadece pointer copy
+        let config = self.config.clone();
+        let http_client = self.http_client.clone();
 
         Box::pin(async move {
             tracing::info!("Starting up offchain market monitor");
-            Self::monitor_orders(signer, cancel_token, prover_addr, provider, config, market_addr)
+            Self::monitor_orders(
+                signer,
+                cancel_token,
+                prover_addr,
+                provider,
+                market_addr,
+                http_client,
+                cached_config, // ✅ Arc<RwLock<CachedConfig>> geçir
+                config
+            )
                 .await
                 .map_err(SupervisorErr::Recover)?;
             Ok(())
