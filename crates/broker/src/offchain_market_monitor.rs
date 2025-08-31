@@ -205,7 +205,7 @@ impl<P> OffchainMarketMonitor<P> where
 
         let rust_api_url_clone = rust_api_url.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3 * 60)); // 3 dakika
+            let mut interval = tokio::time::interval(Duration::from_secs(3 * 10)); // 3 dakika
 
             loop {
                 interval.tick().await;
@@ -602,7 +602,7 @@ impl<P> OffchainMarketMonitor<P> where
         let lock_block = tx_receipt.block_number
             .ok_or_else(|| anyhow::anyhow!("No block number in receipt"))?;
 
-        tracing::info!("İşlem {} başarıyla onaylandı. Lock alındı. Block: {}", tx_hash, lock_block);
+        tracing::info!("\x1b[32mİşlem {} başarıyla onaylandı. Lock alındı. Block: {}\x1b[0m", tx_hash, lock_block);
 
         // Rust API'ye lock verilerini gönder
         tracing::info!("🦀 Rust API'ye lock verilerini gönderme başlatılıyor...");
