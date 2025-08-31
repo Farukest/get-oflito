@@ -381,14 +381,6 @@ impl<P> OffchainMarketMonitor<P> where
             return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"waiting_for_committed_orders\"}\r\n".to_string();
         }
 
-        // JSON parse et
-        let order_json: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(json) => json,
-            Err(_) => {
-                return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid JSON\"}\r\n".to_string();
-            }
-        };
-
         // Direk OrderData'ya deserialize et
         let order_data: boundless_market::order_stream_client::OrderData = match serde_json::from_str(&body) {
             Ok(data) => data,
