@@ -321,6 +321,7 @@ impl<P> OffchainMarketMonitor<P> where
     }
 
     // HTTP isteğini işle
+    // HTTP isteğini işle
     async fn handle_http_request(
         request: &str,
         signer: &PrivateKeySigner,
@@ -329,29 +330,41 @@ impl<P> OffchainMarketMonitor<P> where
         contract_address: Address,
         prover_addr: Address,
     ) -> String {
-        // Basit HTTP parsing
+        // HTTP request'i parse et
         let lines: Vec<&str> = request.lines().collect();
 
         if let Some(first_line) = lines.first() {
             let parts: Vec<&str> = first_line.split_whitespace().collect();
 
-            if parts.len() >= 3 && parts[0] == "POST" && parts[1] == "/api/order" {
-                // POST body'sini bul
-                if let Some(empty_line_index) = lines.iter().position(|&line| line.is_empty()) {
-                    let body_lines = &lines[empty_line_index + 1..];
-                    let body = body_lines.join("\n");
+            match (parts.get(0), parts.get(1)) {
+                (Some(&"POST"), Some(&"/api/order")) => {
+                    // POST body'sini bul
+                    if let Some(empty_line_index) = lines.iter().position(|&line| line.is_empty()) {
+                        let body_lines = &lines[empty_line_index + 1..];
+                        let body = body_lines.join("\n");
 
-                    return Self::process_order(body, signer, provider, config, contract_address, prover_addr).await;
+                        return Self::process_order(body, signer, provider, config, contract_address, prover_addr).await;
+                    } else {
+                        return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Missing request body\"}\r\n".to_string();
+                    }
+                }
+                (Some(&"GET"), Some(&"/health")) => {
+                    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}\r\n".to_string();
+                }
+                (Some(&"GET"), Some(&"/status")) => {
+                    let waiting_status = IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed);
+                    return format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"waiting_for_committed_orders\":{}}}\r\n",
+                        waiting_status
+                    );
+                }
+                _ => {
+                    return "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Not Found\"}\r\n".to_string();
                 }
             }
         }
 
-        // Health check
-        if request.contains("GET /health") {
-            return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}\r\n".to_string();
-        }
-
-        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Not Found\"}\r\n".to_string()
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid request\"}\r\n".to_string()
     }
 
     // Order'ı işle
@@ -521,7 +534,7 @@ impl<P> OffchainMarketMonitor<P> where
         tracing::info!("Transaction processing completed for request: 0x{:x}", request_id);
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"completed\"}\r\n".to_string()
     }
-    
+
     // Bizim transaction'ımızı kontrol et ve lock durumunu da kontrol et
     async fn check_our_transaction_and_lock_status(
         provider: &Arc<P>,
