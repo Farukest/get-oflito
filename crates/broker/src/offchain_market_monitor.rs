@@ -35,6 +35,8 @@ use boundless_market::ProofRequest;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Error)]
 pub enum OffchainMarketMonitorErr {
@@ -262,113 +264,82 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🔄 Committed orders polling initialized");
 
-        // HTTP server'ı başlat
+        // WebSocket server başlat
         let addr: SocketAddr = format!("0.0.0.0:{}", monitor_config.listen_port).parse()
             .map_err(|e| OffchainMarketMonitorErr::UnexpectedErr(anyhow::anyhow!("Invalid address: {}", e)))?;
 
         let listener = TcpListener::bind(addr).await
             .map_err(|e| OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to bind: {}", e)))?;
 
-        tracing::info!("🎧 Offchain market monitor started on port {}", monitor_config.listen_port);
+        tracing::info!("🎧 WebSocket server started on port {}", monitor_config.listen_port);
 
         loop {
             tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((mut socket, _)) => {
-                            let signer = signer.clone();
-                            let provider = provider.clone();
-                            let config = monitor_config.clone();
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let signer = signer.clone();
+                        let provider = provider.clone();
+                        let config = monitor_config.clone();
 
-                            tokio::spawn(async move {
-                                let mut buffer = [0; 4096];
-                                match socket.read(&mut buffer).await {
-                                    Ok(n) if n > 0 => {
-                                        let request = String::from_utf8_lossy(&buffer[..n]);
-                                        let response = Self::handle_http_request(
-                                            &request,
-                                            &signer,
-                                            &provider,
-                                            &config,
-                                            market_addr,
-                                            prover_addr,
-                                        ).await;
-
-                                        if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                            tracing::warn!("Failed to write response: {}", e);
-                                        }
-                                    }
-                                    Ok(_) => {
-                                        tracing::debug!("Empty request received");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to read from socket: {}", e);
-                                    }
+                        tokio::spawn(async move {
+                            match tokio_tungstenite::accept_async(stream).await {
+                                Ok(ws_stream) => {
+                                    Self::handle_websocket_connection(
+                                        ws_stream, &signer, &provider, &config,
+                                        market_addr, prover_addr
+                                    ).await;
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to accept connection: {}", e);
-                        }
+                                Err(e) => {
+                                    tracing::error!("WebSocket handshake failed: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to accept connection: {}", e);
                     }
                 }
-                _ = cancel_token.cancelled() => {
-                    tracing::info!("Offchain market monitor cancelled");
-                    return Ok(());
-                }
             }
+            _ = cancel_token.cancelled() => {
+                return Ok(());
+            }
+        }
         }
     }
 
-    // HTTP isteğini işle
-    // HTTP isteğini işle
-    async fn handle_http_request(
-        request: &str,
+    async fn handle_websocket_connection(
+        mut ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         signer: &PrivateKeySigner,
         provider: &Arc<P>,
         config: &MonitorConfig,
         contract_address: Address,
         prover_addr: Address,
-    ) -> String {
-        // HTTP request'i parse et
-        let lines: Vec<&str> = request.lines().collect();
+    ) {
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let response = Self::process_order_ws(
+                        text, signer, provider, config,
+                        contract_address, prover_addr
+                    ).await;
 
-        if let Some(first_line) = lines.first() {
-            let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-            match (parts.get(0), parts.get(1)) {
-                (Some(&"POST"), Some(&"/api/order")) => {
-                    // POST body'sini bul
-                    if let Some(empty_line_index) = lines.iter().position(|&line| line.is_empty()) {
-                        let body_lines = &lines[empty_line_index + 1..];
-                        let body = body_lines.join("\n");
-
-                        return Self::process_order(body, signer, provider, config, contract_address, prover_addr).await;
-                    } else {
-                        return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Missing request body\"}\r\n".to_string();
-                    }
+                    let _ = ws_stream.send(Message::Text(response)).await;
                 }
-                (Some(&"GET"), Some(&"/health")) => {
-                    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\"}\r\n".to_string();
+                Ok(Message::Close(_)) => break,
+                Err(e) => {
+                    tracing::error!("WebSocket error: {}", e);
+                    break;
                 }
-                (Some(&"GET"), Some(&"/status")) => {
-                    let waiting_status = IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed);
-                    return format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"waiting_for_committed_orders\":{}}}\r\n",
-                        waiting_status
-                    );
-                }
-                _ => {
-                    return "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Not Found\"}\r\n".to_string();
-                }
+                _ => {}
             }
         }
-
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid request\"}\r\n".to_string()
     }
 
+
+
     // Order'ı işle
-    async fn process_order(
+    async fn process_order_ws(
         body: String,
         signer: &PrivateKeySigner,
         provider: &Arc<P>,
@@ -376,17 +347,16 @@ impl<P> OffchainMarketMonitor<P> where
         contract_address: Address,
         prover_addr: Address,
     ) -> String {
-        // Eğer committed orders bekleme modundaysak order processing yapma
+        // Mevcut process_order logic'ini kullan, sadece JSON response döndür
         if IS_WAITING_FOR_COMMITTED_ORDERS.load(Ordering::Relaxed) {
-            return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"waiting_for_committed_orders\"}\r\n".to_string();
+            return r#"{"status":"waiting_for_committed_orders"}"#.to_string();
         }
 
-        // Direk OrderData'ya deserialize et
         let order_data: boundless_market::order_stream_client::OrderData = match serde_json::from_str(&body) {
             Ok(data) => data,
             Err(e) => {
                 tracing::error!("Failed to parse order data: {:?}", e);
-                return "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"Invalid JSON\"}\r\n".to_string();
+                return r#"{"error":"Invalid JSON"}"#.to_string();
             }
         };
 
