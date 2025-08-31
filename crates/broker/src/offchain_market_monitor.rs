@@ -318,13 +318,21 @@ impl<P> OffchainMarketMonitor<P> where
         contract_address: Address,
         prover_addr: Address,
     ) {
+        tracing::info!("Starting to listen for WebSocket messages");
+
         while let Some(msg) = ws_stream.next().await {
+            tracing::info!("Received WebSocket message: {:?}", msg);
+
             match msg {
                 Ok(Message::Text(text)) => {
+                    tracing::info!("Processing text message of length: {}", text.len());
+
                     let response = Self::process_order_ws(
                         text, signer, provider, config,
                         contract_address, prover_addr
                     ).await;
+
+                    tracing::info!("Generated response: {}", response);
 
                     // Response gönder
                     if let Err(e) = ws_stream.send(Message::Text(response)).await {
@@ -332,11 +340,14 @@ impl<P> OffchainMarketMonitor<P> where
                         break;
                     }
 
+                    tracing::info!("Response sent successfully");
+
                     // Connection'ı düzgün kapat
                     if let Err(e) = ws_stream.send(Message::Close(None)).await {
                         tracing::error!("Failed to send close frame: {}", e);
                     }
-                    break; // Tek message işledikten sonra connection'ı kapat
+                    tracing::info!("Close frame sent");
+                    break;
                 }
                 Ok(Message::Close(_)) => {
                     tracing::info!("Client closed connection");
@@ -346,11 +357,14 @@ impl<P> OffchainMarketMonitor<P> where
                     tracing::error!("WebSocket error: {}", e);
                     break;
                 }
-                _ => {}
+                _ => {
+                    tracing::info!("Received other message type");
+                }
             }
         }
-    }
 
+        tracing::info!("WebSocket connection handler finished");
+    }
 
 
     async fn process_order_ws(
