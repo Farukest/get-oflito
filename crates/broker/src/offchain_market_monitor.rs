@@ -266,29 +266,66 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("🎧 WebSocket server started on port {}", monitor_config.listen_port);
 
-        // SELECT KALDIR - DİREKT ACCEPT ET
-        let (stream, _) = tokio::select! {
-            result = listener.accept() => {
-                result.map_err(|e| OffchainMarketMonitorErr::ServerErr(anyhow::anyhow!("Failed to accept: {}", e)))?
+        // SÜREKLI YENİ BAĞLANTILARI DİNLE
+        loop {
+            tokio::select! {
+            // Yeni bağlantı kabul et
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, client_addr)) => {
+                        tracing::info!("📞 New connection from: {}", client_addr);
+
+                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => {
+                                tracing::info!("✅ WebSocket handshake successful with {}", client_addr);
+                                ws
+                            }
+                            Err(e) => {
+                                tracing::error!("❌ WebSocket handshake failed with {}: {}", client_addr, e);
+                                continue; // Bu bağlantıyı skip et, yenisini bekle
+                            }
+                        };
+
+                        // Her bağlantı için ayrı task spawn et
+                        let signer_clone = signer.clone();
+                        let provider_clone = provider.clone();
+                        let monitor_config_clone = monitor_config.clone();
+                        let cancel_token_clone = cancel_token.clone();
+
+                        tokio::spawn(async move {
+                            tracing::info!("🚀 Starting connection handler for {}", client_addr);
+
+                            tokio::select! {
+                                _ = Self::handle_websocket_connection(
+                                    ws_stream,
+                                    &signer_clone,
+                                    &provider_clone,
+                                    &monitor_config_clone,
+                                    market_addr,
+                                    prover_addr
+                                ) => {
+                                    tracing::info!("📴 Connection handler finished for {}", client_addr);
+                                }
+                                _ = cancel_token_clone.cancelled() => {
+                                    tracing::info!("🛑 Connection handler cancelled for {}", client_addr);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Failed to accept connection: {}", e);
+                        // Error'da bile continue et, server'ı çökerme
+                        continue;
+                    }
+                }
             }
+
+            // Cancel signal
             _ = cancel_token.cancelled() => {
-                return Ok(());
+                tracing::info!("🛑 Server shutdown requested");
+                break;
             }
-        };
-
-        tracing::info!("Accepting persistent TCP connection");
-        let ws_stream = tokio_tungstenite::accept_async(stream).await
-            .map_err(|e| OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!("Handshake failed: {}", e)))?;
-
-        tracing::info!("WebSocket handshake successful - starting persistent handler");
-
-        // CANCEL TOKEN İLE BİRLİKTE HANDLERİ ÇALIŞTIR
-        tokio::select! {
-            _ = Self::handle_websocket_connection(
-                ws_stream, &signer, &provider, &monitor_config,
-                market_addr, prover_addr
-            ) => {}
-            _ = cancel_token.cancelled() => {}
+        }
         }
 
         Ok(())
