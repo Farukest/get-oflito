@@ -197,13 +197,12 @@ impl<P> OffchainMarketMonitor<P> where
         }
     }
 
-    // SQLite veritabanı başlatma
     pub async fn init_database() -> Result<SqlitePool, OffchainMarketMonitorErr> {
-        // Veritabanı dizinini belirle
-        let db_dir = "./data";
-        let db_path = "./data/locked_orders.db";
+        // PM2 working directory'den bağımsız mutlak yol
+        let db_path = "/home/get-oflito/crates/broker/data/locked_orders.db";
+        let db_dir = "/home/get-oflito/crates/broker/data";
 
-        // Dizini oluştur (yoksa)
+        // Dizini oluştur
         if let Err(e) = fs::create_dir_all(db_dir) {
             tracing::error!("Failed to create database directory {}: {}", db_dir, e);
             return Err(OffchainMarketMonitorErr::DatabaseErr(
@@ -211,20 +210,7 @@ impl<P> OffchainMarketMonitor<P> where
             ));
         }
 
-        // Dizin yazılabilir mi kontrol et
-        if let Err(e) = fs::metadata(db_dir) {
-            tracing::error!("Cannot access database directory {}: {}", db_dir, e);
-            return Err(OffchainMarketMonitorErr::DatabaseErr(
-                sqlx::Error::Io(e.into())
-            ));
-        }
-
-        tracing::info!("Database directory ensured: {}", db_dir);
-
-        // SQLite bağlantısı kur
         let connection_string = format!("sqlite:{}", db_path);
-        tracing::info!("Connecting to database: {}", connection_string);
-
         let pool = SqlitePool::connect(&connection_string).await.map_err(|e| {
             tracing::error!("Failed to connect to database: {}", e);
             OffchainMarketMonitorErr::DatabaseErr(e)
