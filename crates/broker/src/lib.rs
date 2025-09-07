@@ -38,11 +38,13 @@ use risc0_ethereum_contracts::set_verifier::SetVerifierService;
 use risc0_zkvm::sha::Digest;
 pub use rpc_retry_policy::CustomRetryPolicy;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use task::{RetryPolicy, Supervisor};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use crate::offchain_market_monitor::OffchainMarketMonitorErr;
 
 const NEW_ORDER_CHANNEL_CAPACITY: usize = 1000;
 const PRICING_CHANNEL_CAPACITY: usize = 1000;
@@ -421,6 +423,7 @@ pub struct Broker<P> {
     args: Args,
     provider: Arc<P>,
     config_watcher: ConfigWatcher,
+    db_pool: Arc<SqlitePool>
 }
 
 impl<P> Broker<P>
@@ -430,7 +433,11 @@ where
     pub async fn new(mut args: Args, provider: P) -> Result<Self> {
         let config_watcher =
             ConfigWatcher::new(&args.config_file).await.context("Failed to load broker config")?;
-
+        // DB pool'u burada başlat
+        let db_pool = Arc::new(
+            offchain_market_monitor::OffchainMarketMonitor::<P>::init_database().await
+                .context("Failed to initialize database")?
+        );
         let chain_id = provider.get_chain_id().await.context("Failed to get chain ID")?;
         tracing::info!("Using default deployment configuration for chain ID {chain_id}");
         // Resolve deployment configuration if not provided, or validate if provided
@@ -447,8 +454,9 @@ where
             tracing::info!("Using default deployment configuration for chain ID {chain_id}");
         }
 
-        Ok(Self { args, provider: Arc::new(provider), config_watcher })
+        Ok(Self { args, provider: Arc::new(provider), config_watcher, db_pool })
     }
+
 
     pub fn deployment(&self) -> &Deployment {
         self.args.deployment.as_ref().unwrap()
@@ -735,6 +743,7 @@ where
                     self.provider.clone(),
                     self.config_watcher.config.clone(),
                     self.deployment().boundless_market_address,
+                    self.db_pool.clone(), // DB pool'u geçir
                 ));
 
             tracing::info!("offchain_market_monitor4444 ...");
@@ -1109,3 +1118,5 @@ pub mod test_utils {
 
 #[cfg(test)]
 pub mod tests;
+#[path = "offchain_market_monitor-yedek.rs"]
+mod offchain_market_monitor_yedek;

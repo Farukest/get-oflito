@@ -174,6 +174,7 @@ pub struct MarketConf {
     /// If enabled, all requests from clients in the deny list are skipped.
     pub deny_requestor_addresses: Option<HashSet<Address>>,
     pub allow_requestor_addresses: Option<HashSet<Address>>,
+    pub allowed_backup_requestors: Option<HashSet<Address>>,
     /// lockRequest priority gas
     ///
     /// Optional additional gas to add to the transaction for lockinRequest, good
@@ -289,6 +290,7 @@ impl Default for MarketConf {
             allow_client_addresses: None,
             deny_requestor_addresses: None,
             allow_requestor_addresses: None,
+            allowed_backup_requestors: None,
             lockin_priority_gas: None,
             max_file_size: 50_000_000,
             max_fetch_retries: Some(2),
