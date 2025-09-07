@@ -14,6 +14,7 @@ use boundless_market::{
         boundless_market::BoundlessMarketService, IBoundlessMarket,
     },
 };
+use std::fs;
 use alloy::consensus::Transaction;
 use crate::config::ConfigLock;
 use crate::provers::ProverObj;
@@ -196,27 +197,60 @@ impl<P> OffchainMarketMonitor<P> where
         }
     }
 
-    // ✅ SQLite veritabanı başlatma
+    // SQLite veritabanı başlatma
     pub async fn init_database() -> Result<SqlitePool, OffchainMarketMonitorErr> {
-        let pool = SqlitePool::connect("sqlite:locked_orders.db").await?;
+        // Veritabanı dizinini belirle
+        let db_dir = "./data";
+        let db_path = "./data/locked_orders.db";
+
+        // Dizini oluştur (yoksa)
+        if let Err(e) = fs::create_dir_all(db_dir) {
+            tracing::error!("Failed to create database directory {}: {}", db_dir, e);
+            return Err(OffchainMarketMonitorErr::DatabaseErr(
+                sqlx::Error::Io(e.into())
+            ));
+        }
+
+        // Dizin yazılabilir mi kontrol et
+        if let Err(e) = fs::metadata(db_dir) {
+            tracing::error!("Cannot access database directory {}: {}", db_dir, e);
+            return Err(OffchainMarketMonitorErr::DatabaseErr(
+                sqlx::Error::Io(e.into())
+            ));
+        }
+
+        tracing::info!("Database directory ensured: {}", db_dir);
+
+        // SQLite bağlantısı kur
+        let connection_string = format!("sqlite:{}", db_path);
+        tracing::info!("Connecting to database: {}", connection_string);
+
+        let pool = SqlitePool::connect(&connection_string).await.map_err(|e| {
+            tracing::error!("Failed to connect to database: {}", e);
+            OffchainMarketMonitorErr::DatabaseErr(e)
+        })?;
 
         // Tablo oluştur
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS locked_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id TEXT NOT NULL UNIQUE,
-                tx_hash TEXT NOT NULL,
-                lock_block INTEGER NOT NULL,
-                is_sent BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#
+        CREATE TABLE IF NOT EXISTS locked_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL UNIQUE,
+            tx_hash TEXT NOT NULL,
+            lock_block INTEGER NOT NULL,
+            is_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#
         )
             .execute(&pool)
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create table: {}", e);
+                OffchainMarketMonitorErr::DatabaseErr(e)
+            })?;
 
-        tracing::info!("✅ Database initialized successfully");
+        tracing::info!("Database initialized successfully at: {}", db_path);
         Ok(pool)
     }
 
